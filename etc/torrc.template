@@ -1,0 +1,36 @@
+# Tor configuration for ZTE F50 cep çakısı — bridge mode, NOT exit.
+# See https://2019.www.torproject.org/docs/tor-manual.html.en
+
+# Bridge relay — accepts inbound from censored regions, relays to network
+BridgeRelay 1
+ExitRelay 0
+ExitPolicy reject *:*
+
+# OR port (incoming relay traffic from other tor nodes / bridge users)
+ORPort 9001
+
+# SOCKS proxy for local apps (loopback only — never bind to br0!)
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+
+# Set this to a name + email if you want your bridge to be discoverable
+# via the BridgeDB. Empty → fully anonymous private bridge.
+Nickname F50bridge
+ContactInfo
+
+# Bandwidth — keep low so cellular data quota isn't burned.
+# 256 KB/s sustained, burst 512 KB/s.
+RelayBandwidthRate 256 KB
+RelayBandwidthBurst 512 KB
+
+# State + data dir on /data, NOT inside the module overlay
+DataDirectory /data/tor/state
+
+# No GeoIP files bundled (saves ~26 MB). Disable features that need them.
+DisableNetwork 0
+
+# Log to file (rotated by service.sh)
+Log notice file /data/tor/tor.log
+
+# Allow tor to run without explicitly setting User (we run as root)
+RunAsDaemon 0
