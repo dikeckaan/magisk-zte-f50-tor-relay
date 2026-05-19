@@ -1,5 +1,9 @@
-# Tor configuration for ZTE F50 cep çakısı — bridge mode, NOT exit.
+# Tor configuration for ZTE F50 cep çakısı — bridge + optional transparent proxy.
 # See https://2019.www.torproject.org/docs/tor-manual.html.en
+
+# Drop privileges to shell uid so iptables --uid-owner can isolate
+# tor's own outbound traffic for fwmark-based route switching.
+User shell
 
 # Bridge relay — accepts inbound from censored regions, relays to network
 BridgeRelay 1
@@ -9,28 +13,33 @@ ExitPolicy reject *:*
 # OR port (incoming relay traffic from other tor nodes / bridge users)
 ORPort 9001
 
-# SOCKS proxy for local apps (loopback only — never bind to br0!)
+# SOCKS proxy for local apps (loopback only)
 SocksPort 127.0.0.1:9050
 ControlPort 127.0.0.1:9051
 
-# Set this to a name + email if you want your bridge to be discoverable
-# via the BridgeDB. Empty → fully anonymous private bridge.
+# Transparent proxy ports — used by service.sh when /tor through is on.
+# Listen on br0 gateway (192.168.0.1) so iptables NAT can redirect
+# hotspot client traffic here. No effect unless iptables hooks point at
+# these ports (default: off).
+TransPort 192.168.0.1:9040 IsolateClientAddr
+DNSPort   192.168.0.1:5354
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+
+# Bridge identity
 Nickname F50bridge
 ContactInfo
 
 # Bandwidth — keep low so cellular data quota isn't burned.
-# 256 KB/s sustained, burst 512 KB/s.
 RelayBandwidthRate 256 KB
 RelayBandwidthBurst 512 KB
 
-# State + data dir on /data, NOT inside the module overlay
+# State + data dir on /data
 DataDirectory /data/tor/state
 
-# No GeoIP files bundled (saves ~26 MB). Disable features that need them.
+# No GeoIP files bundled (saves ~26 MB); disable stats that need them
 DisableNetwork 0
 
-# Log to file (rotated by service.sh)
 Log notice file /data/tor/tor.log
 
-# Allow tor to run without explicitly setting User (we run as root)
 RunAsDaemon 0

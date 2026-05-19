@@ -1,74 +1,136 @@
 #!/system/bin/sh
-# tor-relay service — late_start. Supervises tor + maintains VPN-aware
-# outbound routing.
+# tor-relay service — late_start. Three jobs:
+#   1. Supervise the tor daemon
+#   2. Apply VPN-aware outbound routing for tor's OWN traffic (only when
+#      /data/tor/.route_mode = "vpn" — default "direct")
+#   3. Apply per-client transparent-tor routing on br0 (only when
+#      /data/tor/through_clients.json .enabled = true)
 
 DATA=/data/tor
 LOG="$DATA/daemon.log"
 TOR_LOG="$DATA/tor.log"
 MODDIR=/data/adb/modules/tor-relay
+ROUTE_MODE_FILE="$DATA/.route_mode"
+THROUGH_FILE="$DATA/through_clients.json"
 
-mkdir -p "$DATA"
+FWMARK=0x100
+ROUTE_TABLE=200
+TOR_TRANS_PORT=9040
+TOR_DNS_PORT=5354
+HOTSPOT_IF=br0
+HOTSPOT_GW=192.168.0.1
+
+mkdir -p "$DATA/state"
 
 . /data/adb/modules/bin-utils/lib/common.sh
 
-# Wait for network basics
+JQ=$(command -v jq || echo /system/bin/jq)
+
+# Tor needs the state dir writable by uid `shell` (since torrc has `User shell`)
+SHELL_UID=$(id -u shell 2>/dev/null)
+if [ -n "$SHELL_UID" ]; then
+    chown -R shell:shell "$DATA/state" 2>/dev/null
+    chown shell:shell "$DATA/torrc" 2>/dev/null
+fi
+
+# Warm-up
 sleep 25
 
-# ─── VPN-aware routing for outbound tor traffic ────────────────────────────
-# Mark every packet originating from our tor process (matched by fwmark
-# set on tor's network connect()s) and route those packets through a
-# dedicated table (200). That table's default gateway is Tailscale's
-# tailscale0 if Tailscale is up; otherwise it mirrors the cellular default.
-# Effect: when Tailscale is connected, Tor traffic exits via your tailnet
-# (so your bridge IP isn't tied to your operator's mobile pool); otherwise
-# it goes directly via cellular.
+# ─── (1) VPN-aware outbound routing for tor's own traffic ─────────────────
+apply_route_mode() {
+    local mode
+    mode=$(cat "$ROUTE_MODE_FILE" 2>/dev/null)
+    [ -z "$mode" ] && mode=direct
 
-MARK_TOR=0x100
-TABLE_VPN=200
+    # Always start by clearing our marks/rules (idempotent)
+    iptables -t mangle -D OUTPUT -m owner --uid-owner "$SHELL_UID" \
+             -j MARK --set-mark "$FWMARK" 2>/dev/null
+    while ip rule del fwmark "$FWMARK" table "$ROUTE_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$ROUTE_TABLE" 2>/dev/null
 
-# Tor is started as root (no separate uid), so we can't use --uid-owner.
-# Instead, mark all packets going to tor's outbound ports (use cgroup
-# membership marker — but cgroup-v2 setup is heavy on Android). Simplest:
-# mark by destination port range typical of tor traffic, OR mark by
-# source uid if tor runs under a service account.
-#
-# Pragmatic: skip uid-based marking for v1, just route ALL outbound
-# traffic from this device via the dedicated table only IF the user
-# explicitly enables "vpn force-route" mode. Default behaviour: tor uses
-# whatever the system default route is.
-#
-# Reasoning: forcing fwmark routing on tor traffic without uid-segregation
-# would catch all traffic on the device (not just tor). That's a bigger
-# behavioural change than this module should impose by default.
-#
-# v1: log the chosen path each minute so the user knows. Document the
-# manual recipe for users who want kill-switch-style routing.
-
-update_route_status() {
-    if ip link show tailscale0 >/dev/null 2>&1 \
-       && ip -4 addr show tailscale0 | grep -q 'inet '; then
-        ts_ip=$(ip -4 addr show tailscale0 | awk '/inet /{sub("/.*","",$2);print $2; exit}')
-        echo "Tailscale" > "$DATA/.route_path"
-        log_line "route: Tailscale up ($ts_ip) — tor outbound will follow system default; manual: ip rule add fwmark 0x100 table 200"
+    if [ "$mode" = "vpn" ]; then
+        if ! ip link show tailscale0 >/dev/null 2>&1 \
+           || ! ip -4 addr show tailscale0 | grep -q 'inet '; then
+            log_line "route_mode=vpn but Tailscale is down — kill-switch: tor traffic DROPS"
+            ip route add unreachable default table "$ROUTE_TABLE" 2>/dev/null
+        else
+            local ts_ip
+            ts_ip=$(ip -4 addr show tailscale0 | awk '/inet /{sub("/.*","",$2);print $2; exit}')
+            ip route add default dev tailscale0 table "$ROUTE_TABLE" 2>/dev/null
+            log_line "route_mode=vpn — tor outbound via tailscale0 ($ts_ip)"
+        fi
+        # Mark all outbound from tor's uid
+        iptables -t mangle -A OUTPUT -m owner --uid-owner "$SHELL_UID" \
+                 -j MARK --set-mark "$FWMARK"
+        ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE" priority 100
+        echo Tailscale > "$DATA/.route_path"
     else
-        echo "cellular" > "$DATA/.route_path"
-        log_line "route: Tailscale down — tor outbound via cellular default route"
+        # direct mode — tor uses the system default route (cellular)
+        log_line "route_mode=direct — tor outbound via system default"
+        echo cellular > "$DATA/.route_path"
     fi
 }
-update_route_status
 
-# Adaptive loop — log route changes every minute
+# ─── (2) Per-client transparent tor ───────────────────────────────────────
+apply_through_tor() {
+    [ -r "$THROUGH_FILE" ] || return 0
+    local enabled
+    enabled=$("$JQ" -r '.enabled // false' "$THROUGH_FILE" 2>/dev/null)
+
+    # Wipe our chain unconditionally — we'll repopulate if enabled
+    iptables -t nat -D PREROUTING -i "$HOTSPOT_IF" -j TOR_THROUGH 2>/dev/null
+    iptables -t nat -F TOR_THROUGH 2>/dev/null
+    iptables -t nat -X TOR_THROUGH 2>/dev/null
+    iptables -D FORWARD -m mark --mark "$FWMARK"_drop 2>/dev/null
+
+    [ "$enabled" != "true" ] && {
+        log_line "through-tor: disabled"
+        return 0
+    }
+
+    # (Re)create chain
+    iptables -t nat -N TOR_THROUGH 2>/dev/null
+
+    local count=0
+    "$JQ" -r '.clients[]' "$THROUGH_FILE" 2>/dev/null | while read -r ip; do
+        [ -z "$ip" ] && continue
+        echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+        # DNS first (TCP + UDP) → tor DNSPort. Without this, the client
+        # leaks its real DNS even with TCP redirected.
+        iptables -t nat -A TOR_THROUGH -s "$ip" -p udp --dport 53 \
+                 -j REDIRECT --to-ports "$TOR_DNS_PORT"
+        iptables -t nat -A TOR_THROUGH -s "$ip" -p tcp --dport 53 \
+                 -j REDIRECT --to-ports "$TOR_DNS_PORT"
+        # All other TCP → TransPort
+        iptables -t nat -A TOR_THROUGH -s "$ip" -p tcp \
+                 -j REDIRECT --to-ports "$TOR_TRANS_PORT"
+        # Block non-DNS UDP from this client to prevent leaks (Tor is TCP-only)
+        iptables -A FORWARD -s "$ip" -p udp ! --dport 53 -j DROP
+        count=$((count+1))
+        log_line "through-tor: $ip → TransPort $TOR_TRANS_PORT (DNS via $TOR_DNS_PORT)"
+    done
+
+    iptables -t nat -A PREROUTING -i "$HOTSPOT_IF" -j TOR_THROUGH 2>/dev/null
+    log_line "through-tor: enabled for clients (chain TOR_THROUGH active)"
+}
+
+apply_route_mode
+apply_through_tor
+
+# Periodic re-apply (route status may change with Tailscale up/down, and
+# vendor firmware sometimes reorders iptables on tethering toggle).
 (
     while true; do
         sleep 60
-        update_route_status
+        apply_route_mode
+        apply_through_tor
     done
 ) &
 
-# ─── tor supervisor ────────────────────────────────────────────────────────
+# ─── (3) tor supervisor ────────────────────────────────────────────────────
 TOR_BIN="$MODDIR/bin/tor"
 TOR_LIB_PATH="$MODDIR/lib"
-TORRC=/data/tor/torrc
+TORRC="$DATA/torrc"
 
 (
     while true; do
@@ -76,8 +138,7 @@ TORRC=/data/tor/torrc
         log_line "starting tor"
         LD_LIBRARY_PATH="$TOR_LIB_PATH" \
             "$TOR_BIN" -f "$TORRC" >> "$LOG" 2>&1
-        rc=$?
-        log_line "tor exited rc=$rc, restarting in 15 s"
+        log_line "tor exited rc=$?, restarting in 15 s"
         sleep 15
     done
 ) &

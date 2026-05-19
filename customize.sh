@@ -26,12 +26,30 @@ chmod 755 /data/tor /data/tor/state
 
 # Seed torrc on first install
 if [ ! -f /data/tor/torrc ]; then
-    ui_print "  Seeding initial torrc (bridge mode)"
+    ui_print "  Seeding initial torrc (bridge mode + transparent ports)"
     cp "$MODPATH/etc/torrc.template" /data/tor/torrc
     chmod 600 /data/tor/torrc
 else
     ui_print "  Keeping existing /data/tor/torrc"
 fi
+
+# Seed default route mode = direct (cellular)
+[ -f /data/tor/.route_mode ] || echo direct > /data/tor/.route_mode
+
+# Seed empty client through-tor list (disabled)
+if [ ! -f /data/tor/through_clients.json ]; then
+    cat > /data/tor/through_clients.json <<'EOF'
+{
+  "enabled": false,
+  "clients": []
+}
+EOF
+    chmod 644 /data/tor/through_clients.json
+fi
+
+# Tor runs as shell uid (User shell in torrc) — state dir must be writable
+chown -R shell:shell /data/tor/state 2>/dev/null
+chown shell:shell /data/tor/torrc 2>/dev/null
 
 set_perm "$MODPATH/bin/tor"           0 0 0755
 set_perm "$MODPATH/lib/libssl.so.3"   0 0 0644
